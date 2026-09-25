@@ -1,0 +1,98 @@
+import type { loginSchemaBody, registerSchemaBody } from "../validation/schemas.js";
+import { db } from "../db/db.js";
+import { refreshTokens, users } from "../db/schema.js";
+import { and, eq, isNull } from "drizzle-orm";
+import bcrypt from "bcrypt";
+import {AppError} from "../types.js";
+import { generateAccessToken, generateRefreshToken } from "../utils/generateToken.js";
+import jwt from "jsonwebtoken";
+import { createHash } from "node:crypto";
+import { generateHash } from "../utils/generateHash.js";
+
+export class AuthService {
+    async register (data: registerSchemaBody) {
+        const [userExists] = await db.select().from(users).where(eq(users.email, data.email))
+        if(userExists){
+            throw new AppError(400, "User already exists")
+        }
+
+        const passwordHash = await bcrypt.hash(data.password, 10)
+
+        await db.insert(users).values({ ...data, password: passwordHash })
+        return { message: "User created" }
+    }
+
+    async login (data: loginSchemaBody) {
+        const [user] = await db.select().from(users).where(eq(users.name, data.name))
+        if(!user){ throw new AppError(404, "Wrong credentials") }
+
+        const match = await bcrypt.compare(data.password, user.password)
+
+        if(!match){ throw new AppError(404, "Wrong credentials") }
+
+        const accessToken = generateAccessToken(user.id, user.name, user.role)
+        const refreshToken = generateRefreshToken(user.id, user.name, user.role)
+
+        const tokenHash = generateHash(refreshToken)
+
+        const decoded = jwt.decode(refreshToken) as { exp: number }
+        const expiresAt = new Date(decoded.exp * 1000)
+
+        await db.insert(refreshTokens).values({
+            tokenHash,
+            expiresAt,
+            userId: user.id
+        })
+
+        return { accessToken, refreshToken, user: { id: user.id, name: user.name, role: user.role } }
+    }
+
+    async refreshToken(token: string){
+        if(!token){
+            throw new AppError(401, "Refresh token not valid")
+        }
+
+        let decoded: { id: string; role: string; name: string }
+        try{
+            decoded = jwt.verify(token, process.env.REFRESH_TOKEN_SECRET!) as { id: string; role: string; name: string }
+        }catch(err){
+            throw new AppError(401, "Refresh token not valid")
+        }
+
+        const tokenHash = generateHash(token)
+
+        const [hashMatch] = await db.select()
+        .from(refreshTokens)
+        .where(eq(refreshTokens.tokenHash, tokenHash))
+
+        if(!hashMatch || hashMatch.expiresAt < new Date()){
+            throw new AppError(401, "Refresh token not valid")
+        }
+
+        if(hashMatch.revokedAt){
+            await db.update(refreshTokens)
+            .set({ revokedAt: new Date() })
+            .where(and(eq(refreshTokens.userId, decoded.id), isNull(refreshTokens.revokedAt)))
+
+            throw new AppError(401, "Refresh token reuse, please log in again")
+        }
+
+        const accessToken = generateAccessToken(decoded.id, decoded.name, decoded.role)
+        const refreshToken = generateRefreshToken(decoded.id, decoded.name, decoded.role)
+        const newTokenHash = generateHash(refreshToken)
+        
+        const newRefreshDecoded = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET!) as { exp: number }
+        const expiresAt = new Date(newRefreshDecoded.exp * 1000)
+        
+        await db.transaction(async (tx) => {
+            await tx.update(refreshTokens).set({ revokedAt: new Date() }).where(eq(refreshTokens.id, hashMatch.id))
+            await tx.insert(refreshTokens).values({
+                tokenHash: newTokenHash,
+                expiresAt,
+                userId: decoded.id
+            })
+        })
+
+        return { accessToken, refreshToken }
+    }
+}

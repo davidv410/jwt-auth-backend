@@ -1,0 +1,1 @@
+CREATE INDEX "blog_user_index" ON "blog_posts" ("user_id");
